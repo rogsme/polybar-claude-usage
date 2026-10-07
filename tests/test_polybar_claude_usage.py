@@ -1,3 +1,4 @@
+import json
 import re
 import signal
 import subprocess
@@ -31,6 +32,22 @@ STREAM_JSON = "\n".join(
 )
 
 ENVIRONMENT = {"PATH": "/usr/bin:/bin"}
+
+CODEX_FIXTURE = FIXTURES / "codex-rate-limits-0.160.1.json"
+
+# A `codex app-server` that answers the handshake and the rate-limit request, with a notification
+# first, as the real one sends.
+FAKE_CODEX = """while read -r line; do
+  case "$line" in
+    *'"id": 1,'*) echo '{"method":"remoteControl/status/changed","params":{}}'; echo '{"id":1,"result":{}}' ;;
+    *'"id": 2,'*) echo '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":7,"windowDurationMins":10080,"resetsAt":null},"secondary":null}}}' ;;
+  esac
+done"""
+
+
+def claude(snapshot, error=None):
+    """Claude's group alone, as the module renders it when Codex isn't installed."""
+    return [(pcu.CLAUDE, pcu.State(snapshot, error, 0 if error is None else 1, 0))]
 
 
 def meter(glyph="5", percent=0.0, severity=None, meter_id=None, resets_at=None, sort_order=0):
@@ -211,24 +228,24 @@ class ClaudeTests(unittest.TestCase):
         home = self.directory / "home"
 
         # A configured path wins, and a wrong one is reported rather than replaced.
-        self.assertEqual(pcu.locate_claude(str(claude), None, home), claude)
-        self.assertIsNone(pcu.locate_claude(str(self.directory / "nope"), None, home))
+        self.assertEqual(pcu.locate_cli("claude", str(claude), None, home), claude)
+        self.assertIsNone(pcu.locate_cli("claude", str(self.directory / "nope"), None, home))
 
         # Otherwise PATH is searched.
-        self.assertEqual(pcu.locate_claude("", f"/nonexistent:{self.directory}", home), claude)
+        self.assertEqual(pcu.locate_cli("claude", "", f"/nonexistent:{self.directory}", home), claude)
 
         # Then the usual install locations, such as ~/.local/bin.
         local = self.fake_claude("exit 0", home / ".local/bin")
-        self.assertEqual(pcu.locate_claude(None, "/nonexistent", home), local)
+        self.assertEqual(pcu.locate_cli("claude", None, "/nonexistent", home), local)
 
     def test_check_reports_missing_claude(self):
         settings = pcu.Settings(claude_path="/no/such/claude")
         with self.assertRaises(pcu.UsageError) as raised:
-            pcu.check(settings, env={})
+            pcu.check_claude(settings, env={})
         self.assertEqual(raised.exception, pcu.UsageError(pcu.UsageError.CLI_NOT_FOUND, "/no/such/claude"))
 
     def test_environment_includes_install_directories(self):
-        env = pcu.claude_environment({"PATH": "/usr/bin:/bin", "HOME": "/home/me"}, Path("/home/me/.local/bin/claude"))
+        env = pcu.cli_environment({"PATH": "/usr/bin:/bin", "HOME": "/home/me"}, Path("/home/me/.local/bin/claude"))
         path = env["PATH"].split(":")
         self.assertEqual(path[0], "/home/me/.local/bin")
         self.assertIn("/usr/local/bin", path)
@@ -238,6 +255,121 @@ class ClaudeTests(unittest.TestCase):
     def test_unknown_option_parsing(self):
         self.assertEqual(pcu.unknown_option("error: unknown option '--safe-mode'\n"), "--safe-mode")
         self.assertIsNone(pcu.unknown_option("error: something else"))
+
+
+class CodexReportTests(unittest.TestCase):
+    def parse(self, result):
+        return pcu.parse_codex_rate_limits({"id": 2, "result": result}, fetched_at=0)
+
+    def test_parses_real_codex_reply(self):
+        snapshot = pcu.parse_codex_rate_limits(json.loads(CODEX_FIXTURE.read_text(encoding="utf-8")), fetched_at=0)
+        self.assertEqual([m.id for m in snapshot.meters], [pcu.WEEKLY])
+        weekly = snapshot.meter(pcu.WEEKLY)
+        self.assertEqual((weekly.glyph, weekly.percent, weekly.resets_at), ("W", 6, 1_791_977_592))
+        self.assertEqual([m.glyph for m in snapshot.relevant_meters], ["W"])
+
+    def test_windows_by_length(self):
+        snapshot = self.parse(
+            {
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "limitId": "codex",
+                        "primary": {"usedPercent": 40, "windowDurationMins": 300, "resetsAt": 1_000},
+                        "secondary": {"usedPercent": 75, "windowDurationMins": 10080, "resetsAt": 2_000},
+                    }
+                }
+            }
+        )
+        self.assertEqual([(m.glyph, m.percent, m.resets_at) for m in snapshot.meters], [("5", 40, 1_000), ("W", 75, 2_000)])
+        self.assertEqual(snapshot.meter(pcu.WEEKLY).level, pcu.Level.ELEVATED)
+
+    def test_windows_without_a_length(self):
+        # The older single-bucket view, with no window lengths: primary is the 5-hour window.
+        snapshot = self.parse({"rateLimits": {"primary": {"usedPercent": 12}, "secondary": {"usedPercent": 3}}})
+        self.assertEqual([m.id for m in snapshot.meters], [pcu.SESSION, pcu.WEEKLY])
+
+    def test_other_buckets_and_lengths(self):
+        snapshot = self.parse(
+            {
+                "rateLimits": {"limitId": "codex", "primary": {"usedPercent": 5, "windowDurationMins": 10080}},
+                "rateLimitsByLimitId": {
+                    "codex": {"limitId": "codex", "primary": {"usedPercent": 5, "windowDurationMins": 10080}},
+                    "codex_spark": {"limitId": "codex_spark", "limitName": "GPT Spark", "primary": {"usedPercent": 30, "windowDurationMins": 10080}},
+                    "codex_mini": {"limitId": "codex_mini", "primary": {"usedPercent": 9, "windowDurationMins": 1440}},
+                    "codex_idle": {"limitId": "codex_idle", "primary": None, "secondary": None},
+                },
+            }
+        )
+        self.assertEqual([m.id for m in snapshot.meters], [pcu.WEEKLY, "seven_day_gpt_spark", "window_1440_mini"])
+        self.assertEqual((snapshot.meter("seven_day_gpt_spark").title, snapshot.meter("seven_day_gpt_spark").glyph), ("Weekly · GPT Spark", "G"))
+        self.assertEqual((snapshot.meter("window_1440_mini").title, snapshot.meter("window_1440_mini").glyph), ("1d window · Mini", "1d"))
+
+    def test_errors(self):
+        with self.assertRaises(pcu.UsageError) as raised:
+            pcu.parse_codex_rate_limits({"id": 2, "error": {"code": -32600, "message": "codex account authentication required to read rate limits"}})
+        self.assertEqual(raised.exception, pcu.UsageError(pcu.UsageError.NOT_SIGNED_IN, app="Codex"))
+        self.assertEqual(str(raised.exception), "Codex isn't signed in. Run `codex login`.")
+
+        with self.assertRaises(pcu.UsageError) as raised:
+            pcu.parse_codex_rate_limits({"id": 2, "error": {"code": -32601, "message": "method not found"}})
+        self.assertEqual(raised.exception, pcu.UsageError(pcu.UsageError.USAGE_UNAVAILABLE, "method not found", "Codex"))
+
+        with self.assertRaises(pcu.UsageError) as raised:
+            self.parse({"rateLimits": {"primary": None, "secondary": None}})
+        self.assertEqual(raised.exception.kind, pcu.UsageError.USAGE_UNAVAILABLE)
+
+        with self.assertRaises(pcu.UsageError) as raised:
+            pcu.parse_codex_rate_limits({"id": 2})
+        self.assertEqual(raised.exception.kind, pcu.UsageError.INVALID_RESPONSE)
+
+
+class CodexTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp(prefix="pcu-codex-"))
+
+    def tearDown(self):
+        subprocess.run(["rm", "-rf", str(self.directory)], check=False)
+
+    def fake_codex(self, body: str, directory: Path | None = None) -> Path:
+        """Writes an executable shell script standing in for `codex`."""
+        path = (directory or self.directory) / "codex"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
+    def test_asks_app_server_for_rate_limits(self):
+        arguments = self.directory / "arguments.txt"
+        codex = self.fake_codex(f"echo \"$@\" > '{arguments}'\n{FAKE_CODEX}")
+        snapshot = pcu.fetch_codex_usage(codex, ENVIRONMENT, timeout=20)
+        self.assertEqual(snapshot.meter(pcu.WEEKLY).percent, 7)
+        self.assertEqual(arguments.read_text().strip(), "app-server")
+
+    def test_times_out(self):
+        # Reads forever and never answers.
+        codex = self.fake_codex("cat > /dev/null")
+        started = time.monotonic()
+        with self.assertRaises(pcu.UsageError) as raised:
+            pcu.fetch_codex_usage(codex, ENVIRONMENT, timeout=1)
+        self.assertEqual((raised.exception.kind, raised.exception.app), (pcu.UsageError.CLI_FAILED, "Codex"))
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_stops_before_answering(self):
+        codex = self.fake_codex("exit 1")
+        with self.assertRaises(pcu.UsageError) as raised:
+            pcu.fetch_codex_usage(codex, ENVIRONMENT, timeout=20)
+        self.assertEqual(raised.exception.kind, pcu.UsageError.CLI_FAILED)
+
+    def test_locates_codex(self):
+        home = self.directory / "home"
+        local = self.fake_codex("exit 0", home / ".local/bin")
+        self.assertEqual(pcu.locate_cli("codex", None, "/nonexistent", home), local)
+
+    def test_check_reports_missing_codex(self):
+        with self.assertRaises(pcu.UsageError) as raised:
+            pcu.check_codex(pcu.Settings(codex_path="/no/such/codex"), env={})
+        self.assertEqual(raised.exception, pcu.UsageError(pcu.UsageError.CLI_NOT_FOUND, "/no/such/codex", "Codex"))
+        self.assertEqual(str(raised.exception), "Codex isn't at /no/such/codex.")
 
 
 class FormattingTests(unittest.TestCase):
@@ -312,7 +444,7 @@ class RenderTests(unittest.TestCase):
         )
 
     def render(self, **settings):
-        return pcu.render(self.snapshot, None, pcu.Settings(**settings), self.now)
+        return pcu.render(claude(self.snapshot), pcu.Settings(**settings), self.now)
 
     def test_pie(self):
         self.assertEqual(self.render(), "◔ 5 29%  %{F#ff9500}◕ W 75%%{F-}  %{F#ff3b30}● S 95%%{F-}")
@@ -340,11 +472,11 @@ class RenderTests(unittest.TestCase):
             ),
             self.now,
         )
-        self.assertEqual(pcu.render(snapshot, None, pcu.Settings(style="icon"), self.now), "%{F#ff3b30}◑%{F-}")
+        self.assertEqual(pcu.render(claude(snapshot), pcu.Settings(style="icon"), self.now), "%{F#ff3b30}◑%{F-}")
         # Stale and missing numbers are grey; the notification explains.
-        self.assertEqual(pcu.render(self.snapshot, None, pcu.Settings(style="icon"), self.now + 3600), "%{F#888888}●%{F-}")
+        self.assertEqual(pcu.render(claude(self.snapshot), pcu.Settings(style="icon"), self.now + 3600), "%{F#888888}●%{F-}")
         error = pcu.UsageError(pcu.UsageError.NOT_SIGNED_IN)
-        self.assertEqual(pcu.render(None, error, pcu.Settings(style="icon"), self.now), "%{F#888888}○%{F-}")
+        self.assertEqual(pcu.render(claude(None, error), pcu.Settings(style="icon"), self.now), "%{F#888888}○%{F-}")
 
     def test_normal_color_and_options(self):
         line = self.render(style="text", color_normal="#75d85a", show_label=False, meters=("5",), prefix="C ")
@@ -358,25 +490,25 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(self.render(style="text", meters=("X",), color_elevated="", color_critical=""), "5 29%  W 75%  S 95%")
 
     def test_stale_is_dimmed(self):
-        line = pcu.render(self.snapshot, None, pcu.Settings(style="text"), self.now + 3600)
+        line = pcu.render(claude(self.snapshot), pcu.Settings(style="text"), self.now + 3600)
         self.assertEqual(line, "%{F#888888}5 29%  W 75%  S 95%%{F-}")
 
     def test_errors_without_numbers(self):
         settings = pcu.Settings()
-        self.assertEqual(pcu.render(None, None, settings, self.now), "%{F#888888}Claude: …%{F-}")
+        self.assertEqual(pcu.render(claude(None), settings, self.now), "%{F#888888}Claude: …%{F-}")
         self.assertEqual(
-            pcu.render(None, pcu.UsageError(pcu.UsageError.NOT_SIGNED_IN), settings, self.now), "%{F#888888}Claude: sign in%{F-}"
+            pcu.render(claude(None, pcu.UsageError(pcu.UsageError.NOT_SIGNED_IN)), settings, self.now), "%{F#888888}Claude: sign in%{F-}"
         )
         self.assertEqual(
-            pcu.render(None, pcu.UsageError(pcu.UsageError.CLI_NOT_FOUND), settings, self.now), "%{F#888888}Claude: not found%{F-}"
+            pcu.render(claude(None, pcu.UsageError(pcu.UsageError.CLI_NOT_FOUND)), settings, self.now), "%{F#888888}Claude: not found%{F-}"
         )
         # Known numbers keep showing when a later check fails.
         error = pcu.UsageError(pcu.UsageError.USAGE_UNAVAILABLE)
-        self.assertTrue(pcu.render(self.snapshot, error, settings, self.now).startswith("◔ 5 29%"))
+        self.assertTrue(pcu.render(claude(self.snapshot, error), settings, self.now).startswith("◔ 5 29%"))
 
     def test_details(self):
         state = pcu.State(self.snapshot, pcu.UsageError(pcu.UsageError.USAGE_UNAVAILABLE, "slow down"), 1, self.now)
-        text = pcu.details(state, pcu.Settings(), self.now + 300)
+        text = pcu.details([(pcu.CLAUDE, state)], pcu.Settings(), self.now + 300)
         self.assertEqual(
             text.splitlines(),
             [
@@ -387,7 +519,93 @@ class RenderTests(unittest.TestCase):
                 "Last check failed: Claude Code couldn't fetch your usage: slow down",
             ],
         )
-        self.assertEqual(pcu.details(pcu.State(), pcu.Settings(), self.now), "No usage fetched yet.")
+        self.assertEqual(pcu.details([(pcu.CLAUDE, pcu.State())], pcu.Settings(), self.now), "No usage fetched yet.")
+
+
+class ProviderRenderTests(unittest.TestCase):
+    """Claude and Codex in one line."""
+
+    now = 1_000_000.0
+
+    def setUp(self):
+        self.claude = pcu.Snapshot(
+            (pcu.describe_window(pcu.SESSION, 29, None, None), pcu.describe_window(pcu.WEEKLY, 52, None, None)), self.now
+        )
+        self.codex = pcu.Snapshot((pcu.describe_window(pcu.WEEKLY, 95, None, None),), self.now)
+
+    def groups(self, codex=None, codex_error=None):
+        return [
+            (pcu.CLAUDE, pcu.State(self.claude, None, 0, self.now)),
+            (pcu.CODEX, pcu.State(codex, codex_error, 0, self.now)),
+        ]
+
+    def test_both_providers(self):
+        line = pcu.render(self.groups(self.codex), pcu.Settings(style="text"), self.now)
+        self.assertEqual(line, "Claude 5 29%  W 52%  │  Codex %{F#ff3b30}W 95%%{F-}")
+        line = pcu.render(
+            self.groups(self.codex), pcu.Settings(style="text", provider_separator=" | ", codex_name="X", prefix="> "), self.now
+        )
+        self.assertEqual(line, "> Claude 5 29%  W 52% | X %{F#ff3b30}W 95%%{F-}")
+        # Without labels, or with an empty name, the names go too.
+        line = pcu.render(self.groups(self.codex), pcu.Settings(style="text", show_label=False, color_critical=""), self.now)
+        self.assertEqual(line, "29%  52%  │  95%")
+
+    def test_codex_not_installed(self):
+        missing = pcu.UsageError(pcu.UsageError.CLI_NOT_FOUND, app="Codex")
+        # With enabled = auto, a missing Codex is left out and the line is Claude's alone.
+        self.assertEqual(pcu.render(self.groups(codex_error=missing), pcu.Settings(style="text"), self.now), "5 29%  W 52%")
+        # With enabled = true, it says so.
+        line = pcu.render(self.groups(codex_error=missing), pcu.Settings(style="text", codex_enabled="true"), self.now)
+        self.assertEqual(line, "Claude 5 29%  W 52%  │  %{F#888888}Codex: not found%{F-}")
+        # Signed out shows even with auto.
+        signed_out = pcu.UsageError(pcu.UsageError.NOT_SIGNED_IN, app="Codex")
+        line = pcu.render(self.groups(codex_error=signed_out), pcu.Settings(style="text"), self.now)
+        self.assertEqual(line, "Claude 5 29%  W 52%  │  %{F#888888}Codex: sign in%{F-}")
+
+    def test_codex_alone(self):
+        groups = [(pcu.CODEX, pcu.State(self.codex, None, 0, self.now))]
+        self.assertEqual(pcu.render(groups, pcu.Settings(style="text", color_critical=""), self.now), "W 95%")
+        self.assertEqual(pcu.render([(pcu.CODEX, pcu.State())], pcu.Settings(), self.now), "%{F#888888}Codex: …%{F-}")
+
+    def test_icon_covers_every_provider(self):
+        self.assertEqual(pcu.render(self.groups(self.codex), pcu.Settings(style="icon"), self.now), "%{F#ff3b30}●%{F-}")
+
+    def test_stale_provider_is_dimmed_alone(self):
+        stale = pcu.Snapshot(self.codex.meters, self.now - 3600)
+        line = pcu.render(self.groups(stale), pcu.Settings(style="text"), self.now)
+        self.assertEqual(line, "Claude 5 29%  W 52%  │  %{F#888888}Codex W 95%%{F-}")
+
+    def test_meter_filter_by_provider(self):
+        settings = pcu.Settings(style="text", meters=("5", "codex:W"), color_critical="")
+        self.assertEqual(pcu.render(self.groups(self.codex), settings, self.now), "Claude 5 29%  │  Codex W 95%")
+        settings = pcu.Settings(style="text", meters=("claude:W",), color_critical="")
+        self.assertEqual(pcu.render(self.groups(self.codex), settings, self.now), "Claude W 52%  │  Codex W 95%")
+
+    def test_details_and_title(self):
+        error = pcu.UsageError(pcu.UsageError.USAGE_UNAVAILABLE, "busy", "Codex")
+        groups = self.groups(self.codex, error)
+        self.assertEqual(
+            pcu.details(groups, pcu.Settings(), self.now).splitlines(),
+            [
+                "Claude",
+                "Session: 29% · No active window",
+                "Weekly: 52% · No active window",
+                "Updated just now",
+                "",
+                "Codex",
+                "Weekly: 95% · No active window",
+                "Updated just now",
+                "Last check failed: Codex couldn't fetch your usage: busy",
+            ],
+        )
+        self.assertEqual(pcu.usage_title(groups, pcu.Settings()), "Claude & Codex usage")
+        missing = pcu.UsageError(pcu.UsageError.CLI_NOT_FOUND, app="Codex")
+        self.assertEqual(pcu.usage_title(self.groups(codex_error=missing), pcu.Settings()), "Claude usage")
+
+    def test_enabled_providers(self):
+        self.assertEqual(pcu.enabled_providers(pcu.Settings()), [pcu.CLAUDE, pcu.CODEX])
+        self.assertEqual(pcu.enabled_providers(pcu.Settings(claude_enabled="false")), [pcu.CODEX])
+        self.assertEqual(pcu.enabled_providers(pcu.Settings(codex_enabled="false")), [pcu.CLAUDE])
 
 
 class SettingsTests(unittest.TestCase):
@@ -419,7 +637,23 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.color_normal, "#75d85a")
         self.assertEqual(settings.claude_path, "~/bin/claude")
         # Never more often than every 15 seconds.
-        self.assertEqual(settings.interval, 15)
+        self.assertEqual(settings.claude_interval, 15)
+
+    def test_reads_provider_sections(self):
+        settings, warnings = self.load(
+            "[display]\nprovider_separator = \" / \"\n[claude]\nenabled = auto\nname = C\n"
+            "[codex]\nenabled = no\nname =\npath = ~/bin/codex\ninterval = 600\ntimeout = 10\n"
+        )
+        self.assertEqual(warnings, [])
+        self.assertEqual(settings.provider_separator, " / ")
+        self.assertEqual((settings.claude_enabled, settings.claude_name), ("auto", "C"))
+        self.assertEqual(
+            (settings.codex_enabled, settings.codex_name, settings.codex_path, settings.codex_interval, settings.codex_timeout),
+            ("false", "", "~/bin/codex", 600, 10),
+        )
+        settings, warnings = self.load("[codex]\nenabled = sometimes\n")
+        self.assertEqual(settings.codex_enabled, "auto")
+        self.assertEqual(len(warnings), 1)
 
     def test_auto_meters(self):
         settings, _ = self.load("[display]\nmeters = auto\n")
@@ -467,13 +701,36 @@ class StateTests(unittest.TestCase):
 
     def test_round_trip(self):
         state = pcu.State(self.snapshot, pcu.UsageError(pcu.UsageError.USAGE_UNAVAILABLE, "x"), 2, self.now)
-        pcu.write_state(self.paths, state)
-        self.assertEqual(pcu.read_state(self.paths), state)
+        pcu.write_state(self.paths, "claude", state)
+        self.assertEqual(pcu.read_state(self.paths, "claude"), state)
+
+    def test_reads_cache_from_before_codex(self):
+        # Errors cached by earlier versions have no app; they were Claude Code's.
+        self.paths.cache.mkdir(parents=True)
+        self.paths.state_file("claude").write_text(
+            '{"snapshot":null,"error":{"kind":"not_signed_in","detail":null},"failures":1,"checked_at":5}', encoding="utf-8"
+        )
+        self.assertEqual(pcu.read_state(self.paths, "claude").error, pcu.UsageError(pcu.UsageError.NOT_SIGNED_IN))
+        self.assertEqual(self.paths.state_file("claude").name, "state.json")
+        self.assertEqual(self.paths.state_file("codex").name, "codex-state.json")
+
+    def test_providers_are_cached_apart(self):
+        codex = pcu.Snapshot((pcu.describe_window(pcu.WEEKLY, 7, None, None),), self.now)
+        pcu.refresh(self.paths, pcu.Settings(), pcu.CLAUDE, force=True, now=self.now, fetch=lambda: self.snapshot)
+        pcu.refresh(self.paths, pcu.Settings(), pcu.CODEX, force=True, now=self.now, fetch=lambda: codex)
+        self.assertEqual(pcu.read_state(self.paths, "claude").snapshot, self.snapshot)
+        self.assertEqual(pcu.read_state(self.paths, "codex").snapshot, codex)
+
+        def crash():
+            raise RuntimeError("surprise")
+
+        state = pcu.refresh(self.paths, pcu.Settings(), pcu.CODEX, force=True, now=self.now + 10, fetch=crash)
+        self.assertEqual(state.error.app, "Codex")
 
     def test_unreadable_cache_is_empty(self):
         self.paths.cache.mkdir(parents=True)
-        self.paths.state_file.write_text("{nope", encoding="utf-8")
-        self.assertEqual(pcu.read_state(self.paths), pcu.State())
+        self.paths.state_file("claude").write_text("{nope", encoding="utf-8")
+        self.assertEqual(pcu.read_state(self.paths, "claude"), pcu.State())
 
     def test_refresh_only_when_due(self):
         calls = []
@@ -482,33 +739,33 @@ class StateTests(unittest.TestCase):
             calls.append(1)
             return self.snapshot
 
-        settings = pcu.Settings(interval=300)
-        first = pcu.refresh(self.paths, settings, force=False, now=self.now, fetch=fetch)
+        settings = pcu.Settings(claude_interval=300)
+        first = pcu.refresh(self.paths, settings, pcu.CLAUDE, force=False, now=self.now, fetch=fetch)
         self.assertEqual(first.snapshot, self.snapshot)
         # Another bar starting a minute later uses what's there.
-        pcu.refresh(self.paths, settings, force=False, now=self.now + 60, fetch=fetch)
+        pcu.refresh(self.paths, settings, pcu.CLAUDE, force=False, now=self.now + 60, fetch=fetch)
         self.assertEqual(len(calls), 1)
         # Right-click forces a check.
-        pcu.refresh(self.paths, settings, force=True, now=self.now + 61, fetch=fetch)
+        pcu.refresh(self.paths, settings, pcu.CLAUDE, force=True, now=self.now + 61, fetch=fetch)
         self.assertEqual(len(calls), 2)
         # Then the interval applies again.
-        pcu.refresh(self.paths, settings, force=False, now=self.now + 61 + 301, fetch=fetch)
+        pcu.refresh(self.paths, settings, pcu.CLAUDE, force=False, now=self.now + 61 + 301, fetch=fetch)
         self.assertEqual(len(calls), 3)
 
     def test_refresh_keeps_numbers_on_failure(self):
         settings = pcu.Settings()
-        pcu.refresh(self.paths, settings, force=True, now=self.now, fetch=lambda: self.snapshot)
+        pcu.refresh(self.paths, settings, pcu.CLAUDE, force=True, now=self.now, fetch=lambda: self.snapshot)
 
         def fail():
             raise pcu.UsageError(pcu.UsageError.USAGE_UNAVAILABLE, "busy")
 
-        state = pcu.refresh(self.paths, settings, force=True, now=self.now + 10, fetch=fail)
+        state = pcu.refresh(self.paths, settings, pcu.CLAUDE, force=True, now=self.now + 10, fetch=fail)
         self.assertEqual((state.snapshot, state.failures, state.error.detail), (self.snapshot, 1, "busy"))
 
         def crash():
             raise RuntimeError("surprise")
 
-        state = pcu.refresh(self.paths, settings, force=True, now=self.now + 20, fetch=crash)
+        state = pcu.refresh(self.paths, settings, pcu.CLAUDE, force=True, now=self.now + 20, fetch=crash)
         self.assertEqual((state.failures, state.error.kind), (2, pcu.UsageError.CLI_FAILED))
         # Backing off: 2 failures → twice the interval.
         self.assertEqual(state.due_at(300), self.now + 20 + 600)
@@ -520,7 +777,7 @@ class StateTests(unittest.TestCase):
 
 
 class TailTests(unittest.TestCase):
-    """Runs the script the way polybar does, with a fake Claude Code."""
+    """Runs the script the way polybar does, with a fake Claude Code and Codex."""
 
     def test_prints_and_refreshes_on_sigusr1(self):
         directory = Path(tempfile.mkdtemp(prefix="pcu-tail-"))
@@ -537,6 +794,9 @@ class TailTests(unittest.TestCase):
             encoding="utf-8",
         )
         claude.chmod(0o755)
+        codex = bin_dir / "codex"
+        codex.write_text(f"#!/bin/sh\n{FAKE_CODEX}\n", encoding="utf-8")
+        codex.chmod(0o755)
         env = {
             "PATH": f"{bin_dir}:/usr/bin:/bin",
             "HOME": str(directory),
@@ -556,14 +816,15 @@ class TailTests(unittest.TestCase):
             process.stdout.close()
 
         self.addCleanup(stop)
-        self.assertEqual(process.stdout.readline().strip(), "5 11%")
+        self.assertEqual(process.stdout.readline().strip(), "Claude 5 11%  │  Codex W 7%")
         process.send_signal(signal.SIGUSR1)
-        self.assertEqual(process.stdout.readline().strip(), "5 12%")
+        self.assertEqual(process.stdout.readline().strip(), "Claude 5 12%  │  Codex W 7%")
 
         details = subprocess.run(
             [sys.executable, str(ROOT / "polybar_claude_usage.py"), "--details"], env=env, capture_output=True, text=True
         )
-        self.assertEqual(details.stdout.splitlines()[0], "Session: 12% · No active window")
+        self.assertEqual(details.stdout.splitlines()[:2], ["Claude", "Session: 12% · No active window"])
+        self.assertIn("Codex\nWeekly: 7% · No active window", details.stdout)
 
 
 if __name__ == "__main__":

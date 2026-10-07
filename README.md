@@ -1,7 +1,7 @@
 <h1 align="center">polybar-claude-usage</h1>
 
 <p align="center">
-  Your Claude plan limits in polybar.
+  Your Claude and Codex plan limits in polybar.
 </p>
 
 <p align="center">
@@ -22,6 +22,14 @@ A polybar module that shows one small meter for each of your Claude plan's limit
 
 These are the same numbers `/usage` shows in Claude Code and **claude.ai › Settings › Usage**. The limits are shared between claude.ai, the Claude apps and Claude Code, so the module shows your usage across all of them.
 
+If you also use [Codex](https://developers.openai.com/codex/cli), the module shows your ChatGPT plan's Codex limits next to Claude's, with the same labels: `5` for the 5-hour limit and `W` for the weekly one, for whichever your plan has. Each group starts with its name:
+
+```
+Claude ◔ 5 29%  ◑ W 52%  │  Codex ○ W 6%
+```
+
+Without Codex installed, the module shows Claude's limits alone, as before.
+
 It's one Python file with no dependencies beyond the standard library.
 
 ## What it does
@@ -29,7 +37,7 @@ It's one Python file with no dependencies beyond the standard library.
 - Four styles: a filling pie (`◔ 5 29%`), plain text (`5 29%`), a small bar (`5 ▰▰▰▱▱▱▱▱▱▱ 29%`), or a single icon (`◔`) that takes the colour and fill of whichever limit is closest to running out.
 - A limit turns orange, then red, as you get close to it, following Claude's own reading of each one. Numbers that haven't updated in a while turn grey.
 - Left-click sends a notification with exact percentages and when each limit resets. Right-click refreshes.
-- Claude Code doesn't need to be open. The module asks your installed Claude Code for its `/usage` report in the background. Claude Code keeps its own sign-in fresh, and the module never sees a token.
+- Claude Code and Codex don't need to be open. The module asks the installed CLIs for their usage in the background. Each keeps its own sign-in fresh, and the module never sees a token.
 - It checks every 5 minutes by default, backs off when Claude rate-limits the checks, and checks again right after a limit resets.
 - With one bar per monitor, the bars share one cache and take turns, so three monitors still mean one check.
 
@@ -39,6 +47,7 @@ You'll need:
 
 - Linux with polybar and Python 3.10 or later
 - [Claude Code](https://claude.com/claude-code), signed in once with your Claude Pro, Max, Team or Enterprise account (run `claude` and follow the prompts)
+- Optionally, [Codex](https://developers.openai.com/codex/cli), signed in with your ChatGPT account (`codex login`)
 - `notify-send` (from libnotify) for the click-for-details notification
 - A font with the meter glyphs. The defaults are all in **Noto Sans Symbols 2** (`noto-fonts` on Arch) and **DejaVu Sans**.
 
@@ -85,12 +94,15 @@ bar_width = 6
 [claude]
 interval = 600
 path = ~/bin/claude
+
+[codex]
+enabled = false
 ```
 
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `style` | `pie` | `pie`, `text`, `bar` or `icon` |
-| `meters` | `auto` | Which limits to show, by label (`5,W,S`) or id (`seven_day_sonnet`) |
+| `meters` | `auto` | Which limits to show, by label (`5,W,S`) or id (`seven_day_sonnet`). `codex:W` or `claude:5` picks one provider's |
 | `separator`, `prefix` | two spaces, empty | Text between limits, and before them all |
 | `show_label`, `show_percent` | `true` | Show the `5`/`W` labels and the percentages |
 | `pie_glyphs` | `○◔◑◕●` | Pie glyphs from empty to full (two or more) |
@@ -100,9 +112,17 @@ path = ~/bin/claude
 | `color_elevated`, `color_critical` | `#ff9500`, `#ff3b30` | 70% and over, 90% and over (or whatever Claude says) |
 | `color_stale` | `#888888` | Numbers older than 3 intervals (at least 15 minutes) |
 | `time_format` | `%H:%M` | Reset times in the notification (strftime) |
-| `path` | empty | The `claude` executable. Empty searches PATH and the usual places |
+| `provider_separator` | `"  │  "` | Text between the Claude and the Codex limits |
+
+`[claude]` and `[codex]` take the same settings:
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `enabled` | `true` for Claude, `auto` for Codex | `true`, `false`, or `auto` to show the limits only when the CLI is installed |
+| `name` | `Claude`, `Codex` | The name in front of the limits when both are shown. Empty leaves it out |
+| `path` | empty | The `claude` or `codex` executable. Empty searches PATH and the usual places |
 | `interval` | `300` | Seconds between checks, at least 15 |
-| `timeout` | `90` | Seconds to wait for Claude Code |
+| `timeout` | `90` for Claude, `30` for Codex | Seconds to wait for the CLI to answer |
 
 These settings go in this file, not in polybar's `[module/claude-usage]` section, which polybar doesn't pass on to the script.
 
@@ -118,7 +138,7 @@ A setting with a bad value falls back to its default, and the reason goes to pol
 | --- | --- |
 | `polybar-claude-usage` | Keeps running and prints a new line whenever the display changes. This is what polybar runs. `SIGUSR1` makes it check now. |
 | `polybar-claude-usage --once` | Checks once and prints one line. Useful for debugging, or for a module with `interval` instead of `tail`. |
-| `polybar-claude-usage --notify` | Sends a notification with every limit and its reset time. It uses the last result and doesn't run Claude Code. |
+| `polybar-claude-usage --notify` | Sends a notification with every limit and its reset time. It uses the last result and doesn't run Claude Code or Codex. |
 | `polybar-claude-usage --details` | Prints the same details to the terminal. |
 
 ## Where the numbers come from
@@ -134,14 +154,19 @@ claude -p /usage --output-format stream-json --verbose --no-session-persistence 
 - `--safe-mode` keeps your hooks, plugins and MCP servers from starting, and `--no-session-persistence` keeps the checks out of your session history. Claude Code runs in an empty folder, `~/.cache/polybar-claude-usage/workdir`, so no project's settings apply.
 - If your Claude Code is too old to know one of these options, the module drops it and tries again.
 
-The last result is kept in `~/.cache/polybar-claude-usage/state.json` (or under `$XDG_CACHE_HOME`). That lets a restarted polybar show numbers straight away without an extra check.
+For Codex, the module starts `codex app-server`, the JSON-RPC server Codex's editor integrations use, and sends it one `account/rateLimits/read` request:
+
+- Codex fetches the limits with its own sign-in. No message is sent to a model.
+- The server runs in the same empty folder and stops as soon as it has answered.
+
+The last results are kept in `~/.cache/polybar-claude-usage/state.json` for Claude and `codex-state.json` for Codex (or under `$XDG_CACHE_HOME`). That lets a restarted polybar show numbers straight away without an extra check.
 
 ## Privacy and security
 
-- The module makes no network requests of its own. Claude Code does the fetching, with the sign-in it already has.
-- It never reads, stores or sends Claude credentials, tokens or cookies.
+- The module makes no network requests of its own. Claude Code and Codex do the fetching, with the sign-ins they already have.
+- It never reads, stores or sends Claude or OpenAI credentials, tokens or cookies.
 - It has no analytics, telemetry or update checks.
-- It's one readable file. Start with `fetch_usage` in [`polybar_claude_usage.py`](polybar_claude_usage.py) to see how Claude Code is run.
+- It's one readable file. Start with `fetch_usage` and `fetch_codex_usage` in [`polybar_claude_usage.py`](polybar_claude_usage.py) to see how the CLIs are run.
 
 ## Troubleshooting
 
@@ -152,6 +177,12 @@ Install [Claude Code](https://claude.com/claude-code). If it's installed somewhe
 
 **`Claude: sign in`**
 Run `claude` once and sign in with your Claude account. You can quit it afterwards. The module re-checks every minute while signed out, so it recovers on its own.
+
+**`Codex: sign in`**
+Run `codex login`. If you don't use Codex, set `enabled = false` under `[codex]`.
+
+**`Codex: not found`**
+You set `enabled = true` under `[codex]`, but the module can't find `codex`. Set `path` under `[codex]`, or set `enabled` back to `auto`.
 
 **`Claude: error`, or the numbers turn grey**
 Claude limits how often usage can be checked. The module keeps showing the last known values and retries with a growing delay. If it keeps happening, set a longer `interval`. Updating Claude Code with `claude update` can also help. Left-click shows the last error.
@@ -168,16 +199,17 @@ make install   # copy to ~/.local/bin
 ```
 
 ```
-polybar_claude_usage.py   Running Claude Code, reading its usage report, scheduling, rendering
+polybar_claude_usage.py   Running Claude Code and Codex, reading their reports, scheduling, rendering
 config.example.ini        Every setting, commented out at its default
-tests/                    unittest suite, with a trimmed real /usage report in fixtures/
+tests/                    unittest suite, with real /usage and Codex rate-limit replies in fixtures/
 install.sh                Used by make install
 ```
 
 ## Caveats
 
 - The structured usage report Claude Code prints is marked experimental, so its shape may change between Claude Code versions. If it does, the module falls back to reading `/usage`'s text, which has percentages but not reset times.
-- Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic, PBC.
+- `codex app-server` is marked experimental too. If a Codex update changes it, the Codex group shows `Codex: error` and left-click shows why. Claude's limits keep working.
+- Not affiliated with or endorsed by Anthropic or OpenAI. Claude is a trademark of Anthropic, PBC. Codex and ChatGPT are trademarks of OpenAI.
 
 ## License
 
