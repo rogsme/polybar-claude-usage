@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Your Claude plan limits in polybar.
+"""Your Claude and Codex plan limits in polybar.
 
-Asks the installed Claude Code for its `/usage` report and prints one line for a polybar
-`custom/script` module. Claude Code fetches the numbers with its own sign-in and renews that
-sign-in itself, so Claude Code doesn't need to be open and this script never handles a token.
-`/usage` runs locally inside Claude Code: no message is sent to a model.
+Asks the installed Claude Code for its `/usage` report, and the installed Codex for its account
+rate limits, and prints one line for a polybar `custom/script` module. Each tool fetches the
+numbers with its own sign-in and renews that sign-in itself, so neither needs to be open and this
+script never handles a token. Neither check sends a message to a model.
 
 Modes:
   (default)   Keep running and print a new line whenever the display changes (`tail = true`).
               SIGUSR1 refreshes now.
   --once      Fetch once and print one line.
-  --notify    Show every limit and its reset time with notify-send. Never runs Claude Code.
+  --notify    Show every limit and its reset time with notify-send. Never runs Claude Code or Codex.
   --details   Print the same details to the terminal.
 """
 
@@ -23,6 +23,7 @@ import json
 import math
 import os
 import re
+import selectors
 import shutil
 import signal
 import subprocess
@@ -32,9 +33,13 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from enum import IntEnum
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 APP_NAME = "polybar-claude-usage"
+
+# The programs that report the limits, as named in messages.
+CLAUDE_CODE = "Claude Code"
+CODEX_CLI = "Codex"
 
 # MARK: - Model
 
@@ -162,33 +167,40 @@ class Snapshot:
 class UsageError(Exception):
     """Why a refresh produced no numbers."""
 
-    # Claude Code isn't installed, or isn't at the configured path.
+    # The CLI isn't installed, or isn't at the configured path.
     CLI_NOT_FOUND = "cli_not_found"
-    # Claude Code is installed but not signed in to a Claude account.
+    # The CLI is installed but not signed in to an account.
     NOT_SIGNED_IN = "not_signed_in"
-    # Claude Code ran but couldn't fetch the plan's usage this time.
+    # The CLI ran but couldn't fetch the plan's usage this time.
     USAGE_UNAVAILABLE = "usage_unavailable"
-    # Claude Code failed to run or didn't finish.
+    # The CLI failed to run or didn't finish.
     CLI_FAILED = "cli_failed"
     INVALID_RESPONSE = "invalid_response"
 
-    def __init__(self, kind: str, detail: str | None = None) -> None:
+    SIGN_IN_HINTS = {
+        CLAUDE_CODE: "Run `claude` once and sign in.",
+        CODEX_CLI: "Run `codex login`.",
+    }
+
+    def __init__(self, kind: str, detail: str | None = None, app: str = CLAUDE_CODE) -> None:
         super().__init__(kind, detail)
         self.kind = kind
         self.detail = detail
+        # The program that failed, e.g. "Claude Code" or "Codex".
+        self.app = app
 
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, UsageError) and (self.kind, self.detail) == (other.kind, other.detail)
+        return isinstance(other, UsageError) and (self.kind, self.detail, self.app) == (other.kind, other.detail, other.app)
 
     def __hash__(self) -> int:
-        return hash((self.kind, self.detail))
+        return hash((self.kind, self.detail, self.app))
 
     def __repr__(self) -> str:
-        return f"UsageError({self.kind!r}, {self.detail!r})"
+        return f"UsageError({self.kind!r}, {self.detail!r}, {self.app!r})"
 
     @property
     def is_local(self) -> bool:
-        """Problems fixed on this machine (installing or signing in to Claude Code). These are
+        """Problems fixed on this machine (installing or signing in to the CLI). These are
         re-checked every minute so the module recovers soon after."""
         return self.kind in (self.CLI_NOT_FOUND, self.NOT_SIGNED_IN)
 
@@ -202,22 +214,23 @@ class UsageError(Exception):
         return "error"
 
     def __str__(self) -> str:
+        app = self.app
         if self.kind == self.CLI_NOT_FOUND:
-            return f"Claude Code isn't at {self.detail}." if self.detail else "Couldn't find Claude Code."
+            return f"{app} isn't at {self.detail}." if self.detail else f"Couldn't find {app}."
         if self.kind == self.NOT_SIGNED_IN:
-            return "Claude Code isn't signed in. Run `claude` once and sign in."
+            return f"{app} isn't signed in. {self.SIGN_IN_HINTS.get(app, '')}".strip()
         if self.kind == self.USAGE_UNAVAILABLE:
-            return "Claude Code couldn't fetch your usage" + (f": {self.detail}" if self.detail else ".")
+            return f"{app} couldn't fetch your usage" + (f": {self.detail}" if self.detail else ".")
         if self.kind == self.INVALID_RESPONSE:
-            return f"Couldn't read Claude Code's usage report. {self.detail or ''}".strip()
-        return self.detail or "Claude Code failed."
+            return f"Couldn't read {app}'s usage report. {self.detail or ''}".strip()
+        return self.detail or f"{app} failed."
 
     def to_json(self) -> dict[str, Any]:
-        return {"kind": self.kind, "detail": self.detail}
+        return {"kind": self.kind, "detail": self.detail, "app": self.app}
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> "UsageError":
-        return cls(str(data["kind"]), data.get("detail"))
+        return cls(str(data["kind"]), data.get("detail"), str(data.get("app") or CLAUDE_CODE))
 
 
 # MARK: - Lenient JSON helpers
@@ -552,24 +565,27 @@ USAGE_ARGUMENTS = (
 OPTIONAL_ARGUMENTS = frozenset({"--no-session-persistence", "--safe-mode"})
 
 
-def common_locations(home: Path) -> list[Path]:
-    """Where `claude` is usually installed, checked after PATH."""
-    return [
-        home / ".local/bin/claude",
-        home / ".claude/local/claude",
-        Path("/usr/local/bin/claude"),
-        home / ".npm-global/bin/claude",
-        home / ".bun/bin/claude",
-        home / ".volta/bin/claude",
-        Path("/usr/bin/claude"),
+def common_locations(home: Path, name: str = "claude") -> list[Path]:
+    """Where `claude` or `codex` is usually installed, checked after PATH."""
+    locations = [
+        home / ".local/bin" / name,
+        Path("/usr/local/bin") / name,
+        home / ".npm-global/bin" / name,
+        home / ".bun/bin" / name,
+        home / ".volta/bin" / name,
+        Path("/usr/bin") / name,
     ]
+    if name == "claude":
+        # Claude Code's own installer.
+        locations.insert(1, home / ".claude/local/claude")
+    return locations
 
 
 def _is_executable(path: Path) -> bool:
     return path.is_file() and os.access(path, os.X_OK)
 
 
-def locate_claude(custom_path: str | None, search_path: str | None, home: Path | None = None) -> Path | None:
+def locate_cli(name: str, custom_path: str | None, search_path: str | None, home: Path | None = None) -> Path | None:
     """The configured path, then PATH, then common locations. Returns None if a configured path
     doesn't point at an executable."""
     home = Path.home() if home is None else home
@@ -577,13 +593,13 @@ def locate_claude(custom_path: str | None, search_path: str | None, home: Path |
     if custom_path:
         path = Path(os.path.expanduser(custom_path))
         return path if _is_executable(path) else None
-    candidates = [Path(d) / "claude" for d in (search_path or "").split(":") if d]
-    return next((p for p in candidates + common_locations(home) if _is_executable(p)), None)
+    candidates = [Path(d) / name for d in (search_path or "").split(":") if d]
+    return next((p for p in candidates + common_locations(home, name) if _is_executable(p)), None)
 
 
-def claude_environment(base: dict[str, str], executable: Path) -> dict[str, str]:
-    """The environment Claude Code runs with: ours, with a PATH that also covers Claude Code's own
-    directory (for Node, with npm installs) and the usual system directories."""
+def cli_environment(base: dict[str, str], executable: Path) -> dict[str, str]:
+    """The environment Claude Code or Codex runs with: ours, with a PATH that also covers the
+    CLI's own directory (for Node, with npm installs) and the usual system directories."""
     directories = [str(executable.parent)] + base.get("PATH", "").split(":")
     directories += ["/usr/local/bin", "/usr/bin", "/bin", "/usr/local/sbin", "/usr/sbin", "/sbin"]
     unique = list(dict.fromkeys(d for d in directories if d))
@@ -603,37 +619,40 @@ class ProcessResult:
     stderr: str
 
 
+def start_process(arguments: list[str], env: dict[str, str] | None, cwd: Path | None, app: str, **pipes: Any) -> subprocess.Popen:
+    """Starts a command in its own process group, so helpers it starts can be stopped with it."""
+    try:
+        return subprocess.Popen(arguments, env=env, cwd=cwd, start_new_session=True, **pipes)
+    except OSError as error:
+        raise UsageError(UsageError.CLI_FAILED, f"Couldn't start {app} at {arguments[0]} ({error.strerror}).", app)
+
+
+def kill_process(process: subprocess.Popen) -> None:
+    """Stops a command and everything it started: politely, then not."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            break
+        try:
+            process.wait(timeout=2)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def run_process(
-    arguments: list[str], env: dict[str, str] | None, cwd: Path | None, timeout: float
+    arguments: list[str], env: dict[str, str] | None, cwd: Path | None, timeout: float, app: str = CLAUDE_CODE
 ) -> ProcessResult:
     """Runs a command to completion. Raises UsageError if it can't start or doesn't finish."""
-    try:
-        process = subprocess.Popen(
-            arguments,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            cwd=cwd,
-            # Its own process group, so helpers it starts can be stopped with it.
-            start_new_session=True,
-        )
-    except OSError as error:
-        raise UsageError(UsageError.CLI_FAILED, f"Couldn't start Claude Code at {arguments[0]} ({error.strerror}).")
+    process = start_process(
+        arguments, env, cwd, app, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            try:
-                os.killpg(process.pid, sig)
-            except ProcessLookupError:
-                break
-            try:
-                process.communicate(timeout=2)
-                break
-            except subprocess.TimeoutExpired:
-                continue
-        raise UsageError(UsageError.CLI_FAILED, f"Claude Code didn't answer within {int(timeout)} seconds.")
+        kill_process(process)
+        raise UsageError(UsageError.CLI_FAILED, f"{app} didn't answer within {int(timeout)} seconds.", app)
     return ProcessResult(
         process.returncode,
         stdout.decode("utf-8", errors="replace"),
@@ -651,6 +670,146 @@ def fetch_usage(executable: Path, env: dict[str, str] | None = None, cwd: Path |
             arguments.remove(option)
             continue
         return parse_stream_json(result.stdout, result.stderr)
+
+
+# MARK: - Reading Codex's rate limits
+
+# Codex reports each limit's window length in minutes.
+CODEX_SESSION_MINUTES = 300
+CODEX_WEEKLY_MINUTES = 10080
+
+
+def codex_window_meter(window: dict[str, Any], slot: str, name: str | None) -> Meter | None:
+    """Builds a meter from one of a Codex bucket's windows (`primary` or `secondary`). `name` is
+    None for the main `codex` bucket and names any other bucket, such as a model's own limit."""
+    percent = _number(window.get("usedPercent"))
+    if percent is None:
+        return None
+    resets_at = parse_timestamp(window.get("resetsAt"))
+    minutes = _number(window.get("windowDurationMins"))
+    # Without a length, the primary window is the 5-hour one and the secondary the weekly one.
+    if minutes == CODEX_SESSION_MINUTES or (minutes is None and slot == "primary"):
+        base = SESSION
+    elif minutes == CODEX_WEEKLY_MINUTES or (minutes is None and slot == "secondary"):
+        base = WEEKLY
+    else:
+        base = None
+    if base is not None:
+        return describe_window(base if name is None else f"{base}_{slugify(name)}", percent, resets_at, None, name)
+
+    length = fmt_duration((minutes or 0) * 60)
+    meter_id = f"window_{int(minutes or 0)}" + (f"_{slugify(name)}" if name else "")
+    title = f"{length} window" + (f" · {name}" if name else "")
+    detail = f"{name + ' only · ' if name else ''}Rolling {length} window"
+    return Meter(meter_id, title, detail, length, percent, resets_at, 30)
+
+
+def parse_codex_rate_limits(message: dict[str, Any], fetched_at: float | None = None) -> Snapshot:
+    """Reads Codex's reply to `account/rateLimits/read`.
+
+    `rateLimitsByLimitId` has one bucket per metered limit, keyed by its id (`codex` for the
+    plan's own limit). `rateLimits` is the older single-bucket view and is used when the other is
+    missing. Each bucket has up to two windows, such as the 5-hour and the weekly one.
+    """
+    fetched_at = time.time() if fetched_at is None else fetched_at
+    error = _object(message.get("error"))
+    if error is not None:
+        text = _string(error.get("message")) or ""
+        if any(marker in text.lower() for marker in ("authentication", "not logged in", "login", "sign in")):
+            raise UsageError(UsageError.NOT_SIGNED_IN, app=CODEX_CLI)
+        raise UsageError(UsageError.USAGE_UNAVAILABLE, text[:200] or None, CODEX_CLI)
+    result = _object(message.get("result"))
+    if result is None:
+        raise UsageError(UsageError.INVALID_RESPONSE, "The reply has no result.", CODEX_CLI)
+
+    single = _object(result.get("rateLimits"))
+    main = (_string(single.get("limitId")) if single else None) or "codex"
+    buckets = _object(result.get("rateLimitsByLimitId")) or ({main: single} if single else {})
+
+    meters: list[Meter] = []
+    seen: set[str] = set()
+    for limit_id, bucket in buckets.items():
+        if not isinstance(bucket, dict):
+            continue
+        name = None
+        if limit_id != main:
+            name = _string(bucket.get("limitName")) or _prettify(limit_id.removeprefix("codex_"))
+        for slot in ("primary", "secondary"):
+            window = _object(bucket.get(slot))
+            meter = codex_window_meter(window, slot, name) if window else None
+            # The first window of a kind wins.
+            if meter is None or meter.id in seen:
+                continue
+            seen.add(meter.id)
+            meters.append(meter)
+    if not meters:
+        raise UsageError(UsageError.USAGE_UNAVAILABLE, "Codex reported no limits.", CODEX_CLI)
+    return Snapshot(tuple(meters), fetched_at)
+
+
+# MARK: - Running Codex
+#
+# `codex app-server` speaks JSON-RPC, one message per line, over stdin and stdout. After the
+# `initialize` handshake, `account/rateLimits/read` asks Codex for the account's limits, which it
+# fetches with its own sign-in. No message is sent to a model. The server stops when its stdin
+# closes, so stdin stays open until the reply arrives.
+
+CODEX_ARGUMENTS = ("app-server",)
+
+
+def fetch_codex_usage(executable: Path, env: dict[str, str] | None = None, cwd: Path | None = None, timeout: float = 30) -> Snapshot:
+    """Blocking: asks `codex app-server` for the account's rate limits."""
+    process = start_process(
+        [str(executable), *CODEX_ARGUMENTS], env, cwd, CODEX_CLI,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )  # fmt: skip
+    deadline = time.monotonic() + timeout
+    buffer = b""
+
+    def send(message: dict[str, Any]) -> None:
+        process.stdin.write(json.dumps(message).encode("utf-8") + b"\n")
+        process.stdin.flush()
+
+    def reply(request_id: int) -> dict[str, Any]:
+        """Reads until the response to `request_id`, skipping notifications and other messages."""
+        nonlocal buffer
+        while True:
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                try:
+                    message = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(message, dict) and message.get("id") == request_id and "method" not in message:
+                    return message
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                raise UsageError(UsageError.CLI_FAILED, f"Codex didn't answer within {int(timeout)} seconds.", CODEX_CLI)
+            chunk = os.read(process.stdout.fileno(), 65536)
+            if not chunk:
+                raise UsageError(UsageError.CLI_FAILED, "Codex stopped before answering.", CODEX_CLI)
+            buffer += chunk
+
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            send({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": APP_NAME, "version": "1"}}})
+            reply(1)
+            send({"method": "initialized"})
+            send({"id": 2, "method": "account/rateLimits/read"})
+            return parse_codex_rate_limits(reply(2))
+    except OSError as error:
+        raise UsageError(UsageError.CLI_FAILED, f"Couldn't talk to Codex ({error.strerror or error}).", CODEX_CLI)
+    finally:
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            kill_process(process)
+        process.stdout.close()
 
 
 # MARK: - Formatting and scheduling
@@ -769,19 +928,32 @@ class Settings:
     color_critical: str = "#ff3b30"
     color_stale: str = "#888888"
     time_format: str = "%H:%M"
-    # [claude]
+    # Between the Claude and the Codex limits, when both are shown.
+    provider_separator: str = "  │  "
+    # [claude]: "true", "false", or "auto" (only when the CLI is installed).
+    claude_enabled: str = "true"
+    # Shown before Claude's limits when Codex's are shown too. Empty leaves it out.
+    claude_name: str = "Claude"
     claude_path: str = ""
-    interval: float = 300.0
-    timeout: float = 90.0
+    claude_interval: float = 300.0
+    claude_timeout: float = 90.0
+    # [codex]
+    codex_enabled: str = "auto"
+    codex_name: str = "Codex"
+    codex_path: str = ""
+    codex_interval: float = 300.0
+    codex_timeout: float = 30.0
 
 
+_PROVIDER_KEYS = ("enabled", "name", "path", "interval", "timeout")
 _SECTIONS = {
     "display": (
         "style", "meters", "separator", "prefix", "show_label", "show_percent", "pie_glyphs", "icon",
         "bar_width", "bar_chars", "color_normal", "color_elevated", "color_critical", "color_stale",
-        "time_format",
+        "time_format", "provider_separator",
     ),
-    "claude": ("path", "interval", "timeout"),
+    "claude": _PROVIDER_KEYS,
+    "codex": _PROVIDER_KEYS,
 }  # fmt: skip
 
 
@@ -810,6 +982,15 @@ def _parse_setting(name: str, raw: str) -> Any:
         if lowered in ("0", "no", "false", "off"):
             return False
         raise ValueError("must be true or false")
+    if name.endswith("_enabled"):
+        lowered = value.lower()
+        if lowered in ("1", "yes", "true", "on"):
+            return "true"
+        if lowered in ("0", "no", "false", "off"):
+            return "false"
+        if lowered == "auto":
+            return lowered
+        raise ValueError("must be true, false or auto")
     if name == "pie_glyphs":
         if len(value) < 2:
             raise ValueError("needs at least 2 characters, empty to full")
@@ -830,11 +1011,11 @@ def _parse_setting(name: str, raw: str) -> Any:
     if name == "time_format":
         datetime.now().strftime(value)
         return value
-    if name in ("interval", "timeout"):
+    if name.endswith(("_interval", "_timeout")):
         number = float(value)
         if not math.isfinite(number) or number <= 0:
             raise ValueError("must be a positive number of seconds")
-        return max(number, MINIMUM_DELAY) if name == "interval" else number
+        return max(number, MINIMUM_DELAY) if name.endswith("_interval") else number
     return value
 
 
@@ -861,7 +1042,8 @@ def load_settings(path: Path) -> tuple[Settings, list[str]]:
             if key not in _SECTIONS[section]:
                 warnings.append(f"{path}: unknown setting {key} in [{section}]")
                 continue
-            name = "claude_path" if (section, key) == ("claude", "path") else key
+            # [claude] and [codex] keys become claude_path, codex_interval and so on.
+            name = key if section == "display" else f"{section}_{key}"
             try:
                 values[name] = _parse_setting(name, raw)
             except ValueError as error:
@@ -869,7 +1051,68 @@ def load_settings(path: Path) -> tuple[Settings, list[str]]:
     return replace(defaults, **values), warnings
 
 
+# MARK: - Providers
+
+
+def check_claude(settings: Settings, env: dict[str, str] | None = None, cwd: Path | None = None) -> Snapshot:
+    """Finds Claude Code and fetches usage once."""
+    env = dict(os.environ) if env is None else env
+    executable = locate_cli("claude", settings.claude_path, env.get("PATH"))
+    if executable is None:
+        raise UsageError(UsageError.CLI_NOT_FOUND, settings.claude_path.strip() or None)
+    return fetch_usage(executable, cli_environment(env, executable), cwd, settings.claude_timeout)
+
+
+def check_codex(settings: Settings, env: dict[str, str] | None = None, cwd: Path | None = None) -> Snapshot:
+    """Finds Codex and fetches its rate limits once."""
+    env = dict(os.environ) if env is None else env
+    executable = locate_cli("codex", settings.codex_path, env.get("PATH"))
+    if executable is None:
+        raise UsageError(UsageError.CLI_NOT_FOUND, settings.codex_path.strip() or None, CODEX_CLI)
+    return fetch_codex_usage(executable, cli_environment(env, executable), cwd, settings.codex_timeout)
+
+
+@dataclass(frozen=True)
+class Provider:
+    """A tool whose plan limits are shown."""
+
+    # Stable key, used for settings (`[codex] interval` is `codex_interval`) and cache files.
+    key: str
+    # Name in messages and the notification title, e.g. "Codex".
+    title: str
+    # The program that reports the limits, e.g. "Claude Code".
+    app: str
+    # Finds the program and fetches once: (settings, env=None, cwd=None) → Snapshot.
+    check: Callable[..., Snapshot]
+
+    def setting(self, settings: Settings, name: str) -> Any:
+        return getattr(settings, f"{self.key}_{name}")
+
+    def enabled(self, settings: Settings) -> str:
+        """"true", "false" or "auto"."""
+        return self.setting(settings, "enabled")
+
+    def label(self, settings: Settings) -> str:
+        """The name shown before this provider's limits. May be empty."""
+        return self.setting(settings, "name")
+
+    def interval(self, settings: Settings) -> float:
+        return self.setting(settings, "interval")
+
+
+CLAUDE = Provider("claude", "Claude", CLAUDE_CODE, check_claude)
+CODEX = Provider("codex", "Codex", CODEX_CLI, check_codex)
+PROVIDERS = (CLAUDE, CODEX)
+
+
+def enabled_providers(settings: Settings) -> list[Provider]:
+    return [p for p in PROVIDERS if p.enabled(settings) != "false"]
+
+
 # MARK: - Rendering
+
+# A provider with its last result.
+Group = tuple["Provider", "State"]
 
 
 def colorize(text: str, color: str) -> str:
@@ -884,14 +1127,32 @@ def _level_color(level: Level, settings: Settings) -> str:
     }[level]
 
 
-def selected_meters(snapshot: Snapshot, settings: Settings) -> list[Meter]:
-    """The meters to show: those in use, or the ones the `meters` setting names."""
-    if settings.meters:
-        wanted = {m.upper() for m in settings.meters}
-        chosen = [m for m in snapshot.meters if m.glyph.upper() in wanted or m.id.upper() in wanted]
-        if chosen:
-            return chosen
-    return snapshot.relevant_meters
+def selected_meters(snapshot: Snapshot, settings: Settings, provider: str) -> list[Meter]:
+    """The meters to show: those in use, or the ones the `meters` setting names. An entry such as
+    `codex:W` names one provider's meter; one without a provider names every provider's."""
+    wanted = set()
+    for item in settings.meters:
+        scope, _, name = item.rpartition(":")
+        if scope.strip().lower() in ("", provider):
+            wanted.add(name.strip().upper())
+    chosen = [m for m in snapshot.meters if m.glyph.upper() in wanted or m.id.upper() in wanted]
+    return chosen or snapshot.relevant_meters
+
+
+def shown_groups(groups: list[Group], settings: Settings) -> list[Group]:
+    """The providers to show. One set to `auto` that isn't installed is left out, unless that
+    leaves nothing."""
+    shown = [
+        (provider, state)
+        for provider, state in groups
+        if not (
+            provider.enabled(settings) == "auto"
+            and state.snapshot is None
+            and state.error is not None
+            and state.error.kind == UsageError.CLI_NOT_FOUND
+        )
+    ]
+    return shown or groups
 
 
 def pie_glyph(fraction: float, settings: Settings) -> str:
@@ -900,16 +1161,25 @@ def pie_glyph(fraction: float, settings: Settings) -> str:
 
 
 def most_constrained(meters: list[Meter]) -> Meter | None:
-    """The meter closest to its limit, going by Claude's reading first."""
+    """The meter closest to its limit, going by Claude's or Codex's reading first."""
     return max(meters, key=lambda m: (m.level, m.percent), default=None)
 
 
-def render_icon(meters: list[Meter], settings: Settings) -> tuple[str, Level]:
+def render_icon(groups: list[Group], settings: Settings, now: float) -> str:
     """The icon style: one glyph for every limit, at the level of the closest one."""
-    worst = most_constrained(meters)
+    entries = [
+        (meter, is_stale(state.snapshot, provider.interval(settings), now))
+        for provider, state in groups
+        if state.snapshot is not None
+        for meter in selected_meters(state.snapshot, settings, provider.key)
+    ]
+    worst = most_constrained([meter for meter, _ in entries])
     if worst is None:
-        return settings.icon or settings.pie_glyphs[0], Level.NORMAL
-    return settings.icon or pie_glyph(worst.fraction, settings), worst.level
+        # Too small for a message; the notification explains.
+        return colorize(settings.prefix + (settings.icon or settings.pie_glyphs[0]), settings.color_stale)
+    stale = next(stale for meter, stale in entries if meter is worst)
+    icon = settings.icon or pie_glyph(worst.fraction, settings)
+    return colorize(settings.prefix + icon, settings.color_stale if stale else _level_color(worst.level, settings))
 
 
 def render_meter(meter: Meter, settings: Settings) -> str:
@@ -927,48 +1197,70 @@ def render_meter(meter: Meter, settings: Settings) -> str:
     return " ".join(p for p in parts if p)
 
 
-def render(snapshot: Snapshot | None, error: UsageError | None, settings: Settings, now: float) -> str:
-    """The line polybar shows."""
-    if snapshot is None:
-        if settings.style == "icon":
-            # Too small for a message; the notification explains.
-            return colorize(settings.prefix + render_icon([], settings)[0], settings.color_stale)
-        message = error.short if error is not None else "…"
-        return colorize(f"{settings.prefix}Claude: {message}", settings.color_stale)
-    meters = selected_meters(snapshot, settings)
-    if settings.style == "icon":
-        icon, level = render_icon(meters, settings)
-        stale = is_stale(snapshot, settings.interval, now)
-        return colorize(settings.prefix + icon, settings.color_stale if stale else _level_color(level, settings))
-    if is_stale(snapshot, settings.interval, now):
-        return colorize(settings.prefix + settings.separator.join(render_meter(m, settings) for m in meters), settings.color_stale)
-    segments = [colorize(render_meter(m, settings), _level_color(m.level, settings)) for m in meters]
-    return settings.prefix + settings.separator.join(segments)
-
-
-def details(state: "State", settings: Settings, now: float) -> str:
-    """Every limit with its reset time, for --notify and --details."""
+def render_group(provider: Provider, state: State, settings: Settings, now: float, named: bool) -> tuple[str, str]:
+    """One provider's part of the line, and a colour for all of it when its numbers are stale or
+    missing ("" when each meter has its own). `named` puts the provider's name in front."""
     snapshot = state.snapshot
-    lines: list[str] = []
-    if snapshot is not None:
-        for meter in snapshot.relevant_meters:
-            reset = reset_description(meter.resets_at, now, settings.time_format)
-            lines.append(f"{meter.title}: {fmt_percent(meter.percent)} · {reset}")
-        updated = f"Updated {fmt_age(snapshot.fetched_at, now)}"
-        if is_stale(snapshot, settings.interval, now):
-            updated += " (out of date)"
-        lines.append(updated)
-    else:
-        lines.append("No usage fetched yet.")
-    if state.error is not None:
-        lines.append(f"Last check failed: {state.error}")
-    return "\n".join(lines)
+    if snapshot is None:
+        message = state.error.short if state.error is not None else "…"
+        return f"{provider.label(settings) or provider.title}: {message}", settings.color_stale
+    meters = selected_meters(snapshot, settings, provider.key)
+    name = provider.label(settings) if named and settings.show_label else ""
+    lead = f"{name} " if name else ""
+    if is_stale(snapshot, provider.interval(settings), now):
+        return lead + settings.separator.join(render_meter(m, settings) for m in meters), settings.color_stale
+    segments = [colorize(render_meter(m, settings), _level_color(m.level, settings)) for m in meters]
+    return lead + settings.separator.join(segments), ""
+
+
+def render(groups: list[Group], settings: Settings, now: float) -> str:
+    """The line polybar shows."""
+    groups = shown_groups(groups, settings)
+    if settings.style == "icon":
+        return render_icon(groups, settings, now)
+    parts = [render_group(provider, state, settings, now, named=len(groups) > 1) for provider, state in groups]
+    if len(parts) == 1 and parts[0][1]:
+        # A single grey group takes the prefix with it.
+        text, color = parts[0]
+        return colorize(settings.prefix + text, color)
+    return settings.prefix + settings.provider_separator.join(colorize(text, color) for text, color in parts)
+
+
+def details(groups: list[Group], settings: Settings, now: float) -> str:
+    """Every limit with its reset time, for --notify and --details. With more than one provider,
+    each gets a block under its name."""
+    groups = shown_groups(groups, settings)
+    blocks: list[str] = []
+    for provider, state in groups:
+        lines = [provider.label(settings) or provider.title] if len(groups) > 1 else []
+        snapshot = state.snapshot
+        if snapshot is not None:
+            for meter in snapshot.relevant_meters:
+                reset = reset_description(meter.resets_at, now, settings.time_format)
+                lines.append(f"{meter.title}: {fmt_percent(meter.percent)} · {reset}")
+            updated = f"Updated {fmt_age(snapshot.fetched_at, now)}"
+            if is_stale(snapshot, provider.interval(settings), now):
+                updated += " (out of date)"
+            lines.append(updated)
+        else:
+            lines.append("No usage fetched yet.")
+        if state.error is not None:
+            lines.append(f"Last check failed: {state.error}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def usage_title(groups: list[Group], settings: Settings) -> str:
+    """"Claude usage", "Codex usage" or "Claude & Codex usage"."""
+    titles = [provider.title for provider, _ in shown_groups(groups, settings)]
+    return " & ".join(titles or [CLAUDE.title]) + " usage"
 
 
 # MARK: - Shared state
 #
 # Polybar starts one module per bar (often one bar per monitor). They share the last result through
-# a cache file and take turns fetching under a lock, so extra bars don't mean extra checks.
+# a cache file per provider and take turns fetching under a lock, so extra bars don't mean extra
+# checks.
 
 
 @dataclass
@@ -977,7 +1269,7 @@ class State:
     error: UsageError | None = None
     # Failed attempts in a row, including the last one.
     failures: int = 0
-    # When Claude Code was last asked, successfully or not.
+    # When the CLI was last asked, successfully or not.
     checked_at: float | None = None
 
     def due_at(self, interval: float) -> float:
@@ -1018,62 +1310,54 @@ class Paths:
         cache_home = Path(env.get("XDG_CACHE_HOME") or home / ".cache")
         return cls(config=config_home / APP_NAME / "config.ini", cache=cache_home / APP_NAME)
 
-    @property
-    def state_file(self) -> Path:
-        return self.cache / "state.json"
+    def state_file(self, provider: str) -> Path:
+        # Claude's keeps the name it had before Codex was added.
+        return self.cache / ("state.json" if provider == CLAUDE.key else f"{provider}-state.json")
 
-    @property
-    def lock_file(self) -> Path:
-        return self.cache / "fetch.lock"
+    def lock_file(self, provider: str) -> Path:
+        return self.cache / ("fetch.lock" if provider == CLAUDE.key else f"{provider}-fetch.lock")
 
     @property
     def workdir(self) -> Path:
-        """An empty folder to run Claude Code in, so no project's settings or CLAUDE.md apply."""
+        """An empty folder to run the CLIs in, so no project's settings or CLAUDE.md apply."""
         return self.cache / "workdir"
 
 
-def read_state(paths: Paths) -> State:
+def read_state(paths: Paths, provider: str) -> State:
     try:
-        return State.from_json(json.loads(paths.state_file.read_text(encoding="utf-8")))
+        return State.from_json(json.loads(paths.state_file(provider).read_text(encoding="utf-8")))
     except (OSError, ValueError, KeyError, TypeError):
         return State()
 
 
-def write_state(paths: Paths, state: State) -> None:
+def write_state(paths: Paths, provider: str, state: State) -> None:
     paths.cache.mkdir(parents=True, exist_ok=True)
-    temporary = paths.state_file.with_suffix(f".{os.getpid()}.tmp")
+    state_file = paths.state_file(provider)
+    temporary = state_file.with_suffix(f".{os.getpid()}.tmp")
     temporary.write_text(json.dumps(state.to_json()), encoding="utf-8")
-    os.replace(temporary, paths.state_file)
+    os.replace(temporary, state_file)
 
 
-def check(settings: Settings, env: dict[str, str] | None = None, cwd: Path | None = None) -> Snapshot:
-    """Finds Claude Code and fetches usage once."""
-    env = dict(os.environ) if env is None else env
-    executable = locate_claude(settings.claude_path, env.get("PATH"))
-    if executable is None:
-        raise UsageError(UsageError.CLI_NOT_FOUND, settings.claude_path.strip() or None)
-    return fetch_usage(executable, claude_environment(env, executable), cwd, settings.timeout)
-
-
-def refresh(paths: Paths, settings: Settings, force: bool, now: float | None = None, fetch=None) -> State:
+def refresh(paths: Paths, settings: Settings, provider: Provider, force: bool, now: float | None = None, fetch=None) -> State:
     """Fetches when due (or when forced) and records the result. Another bar that fetched while
     this one waited for the lock counts, unless this refresh was forced."""
-    fetch = fetch or (lambda: check(settings, cwd=paths.workdir))
+    fetch = fetch or (lambda: provider.check(settings, cwd=paths.workdir))
     paths.cache.mkdir(parents=True, exist_ok=True)
     paths.workdir.mkdir(parents=True, exist_ok=True)
-    with open(paths.lock_file, "w") as lock:
+    with open(paths.lock_file(provider.key), "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        state = read_state(paths)
+        state = read_state(paths, provider.key)
         started = time.time() if now is None else now
-        if not force and state.due_at(settings.interval) > started:
+        if not force and state.due_at(provider.interval(settings)) > started:
             return state
         try:
             state = State(fetch(), None, 0, started)
         except UsageError as error:
             state = State(state.snapshot, error, state.failures + 1, started)
         except Exception as error:  # Never let one bad run stop the module.
-            state = State(state.snapshot, UsageError(UsageError.CLI_FAILED, str(error)), state.failures + 1, started)
-        write_state(paths, state)
+            failure = UsageError(UsageError.CLI_FAILED, str(error), provider.app)
+            state = State(state.snapshot, failure, state.failures + 1, started)
+        write_state(paths, provider.key, state)
         return state
 
 
@@ -1119,25 +1403,26 @@ def run_tail(paths: Paths, style: str | None) -> None:
         warnings.report(problems)
         if style:
             settings = replace(settings, style=style)
-        state = refresh(paths, settings, force)
+        groups = [(provider, refresh(paths, settings, provider, force)) for provider in enabled_providers(settings)]
         now = time.time()
-        output.show(render(state.snapshot, state.error, settings, now))
+        output.show(render(groups, settings, now))
 
-        timeout = min(TICK, max(state.due_at(settings.interval) - now, 1.0))
+        due = min((state.due_at(provider.interval(settings)) for provider, state in groups), default=now + TICK)
+        timeout = min(TICK, max(due - now, 1.0))
         force = signal.sigtimedwait([signal.SIGUSR1], timeout) is not None
 
 
-def notify(text: str) -> None:
+def notify(title: str, text: str) -> None:
     notify_send = shutil.which("notify-send")
     if notify_send is None:
         print(text)
         print(f"{APP_NAME}: notify-send isn't installed.", file=sys.stderr)
         return
-    subprocess.run([notify_send, "--app-name=Claude Usage", "Claude usage", text], check=False)
+    subprocess.run([notify_send, "--app-name=Claude Usage", title, text], check=False)
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog=APP_NAME, description="Your Claude plan limits in polybar.")
+    parser = argparse.ArgumentParser(prog=APP_NAME, description="Your Claude and Codex plan limits in polybar.")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--once", action="store_true", help="fetch once, print one line and exit")
     mode.add_argument("--notify", action="store_true", help="show every limit with notify-send (no fetch)")
@@ -1155,14 +1440,16 @@ def main(argv: list[str] | None = None) -> int:
             Warnings().report(problems)
             if args.style:
                 settings = replace(settings, style=args.style)
-            state = refresh(paths, settings, force=True)
-            if state.error is not None:
-                print(f"{APP_NAME}: {state.error}", file=sys.stderr)
-            print(render(state.snapshot, state.error, settings, time.time()), flush=True)
+            groups = [(provider, refresh(paths, settings, provider, force=True)) for provider in enabled_providers(settings)]
+            for _, state in shown_groups(groups, settings):
+                if state.error is not None:
+                    print(f"{APP_NAME}: {state.error}", file=sys.stderr)
+            print(render(groups, settings, time.time()), flush=True)
         elif args.notify or args.details:
             settings, _ = load_settings(paths.config)
-            text = details(read_state(paths), settings, time.time())
-            notify(text) if args.notify else print(text)
+            groups = [(provider, read_state(paths, provider.key)) for provider in enabled_providers(settings)]
+            text = details(groups, settings, time.time())
+            notify(usage_title(groups, settings), text) if args.notify else print(text)
         else:
             run_tail(paths, args.style)
     except BrokenPipeError:
