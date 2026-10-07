@@ -11,6 +11,10 @@
 </p>
 
 <p align="center">
+  🍎 On macOS? Try <a href="https://github.com/mihok/osx-claude-usage"><b>osx-claude-usage</b></a> by <a href="https://github.com/mihok">@mihok</a>, the menu bar app this module was forked from.
+</p>
+
+<p align="center">
   <img src="docs/bar.png" width="900" alt="The pie, text and bar styles side by side in polybar, with the weekly limit in orange and the Sonnet limit in red">
 </p>
 
